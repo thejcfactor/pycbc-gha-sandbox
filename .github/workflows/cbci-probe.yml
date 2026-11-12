@@ -1,0 +1,417 @@
+name: cbci-probe
+
+# Smallest end-to-end exercise of the CI-core contract on GitHub-hosted runners:
+#
+#   core -> plan -> lint -> sdist -> ONE linux x86_64 wheel
+#
+# The point is the boundary, not the support matrix: does `engine.py plan` feed a GHA
+# matrix, and does `tasks.sh` run unmodified on a hosted runner? One build unit answers
+# both.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cbci_repo:
+        description: "Public repository holding the CI core."
+        required: false
+        default: "couchbaselabs/sdkbuild-jenkinsfiles"
+        type: string
+      cbci_ref:
+        description: "CI core ref (branch/tag/sha). A work branch tests unpublished core."
+        required: false
+        default: "master"
+        type: string
+      cbci_path:
+        description: "Directory of the CI core inside cbci_repo."
+        required: false
+        default: "python/ci_scripts_v2"
+        type: string
+      libc:
+        description: "linux libc flavor for the probe wheel."
+        required: false
+        default: "manylinux"
+        type: choice
+        options:
+          - manylinux
+          - musllinux
+      custom_image:
+        description: "Build the couchbase manylinux image first (matches Jenkins). Off uses the stock pypa image."
+        required: false
+        default: true
+        type: boolean
+      config_override:
+        description: "JSON object deep-merged over ci-config.yaml (CBCI_CONFIG_OVERRIDE)."
+        required: false
+        default: ""
+        type: string
+      verbose:
+        description: "Verbose compiler/CMake output."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cbci-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CBCI_PROJECT_TYPE: OPERATIONAL
+  CORE: ${{ github.workspace }}/core
+  # The SDK is checked out into a subdirectory so the staged core never lands inside its
+  # tree, where it would dirty the version stamp and be seen by lint.
+  SDK: ${{ github.workspace }}/sdk
+  # Interpreter that runs the tooling, independent of the wheels' pythons. Must equal
+  # `support.default_python` in ci-config; gha.py fails the run when the two disagree.
+  CBCI_DEFAULT_PYTHON: "3.11"
+
+jobs:
+  core:
+    name: core (${{ inputs.cbci_ref }})
+    runs-on: ubuntu-24.04
+    steps:
+      # bootstrap.sh fetches the fixed manifest from the same base and verifies every file
+      # against the hashes it pins.
+      - name: Stage CI core
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/${CBCI_REPO}/${CBCI_REF}/${CBCI_PATH}"
+          echo "CI core from ${base}"
+          curl -fsSL "${base}/bootstrap.sh" -o "${RUNNER_TEMP}/bootstrap.sh"
+          CBCI_BASE_URL="$base" CBCI_DEST="$CORE" bash "${RUNNER_TEMP}/bootstrap.sh"
+        env:
+          CBCI_REPO: ${{ inputs.cbci_repo }}
+          CBCI_REF: ${{ inputs.cbci_ref }}
+          CBCI_PATH: ${{ inputs.cbci_path }}
+
+      # Artifact transfer is not a verified channel, so every consumer re-checks these.
+      - name: Record core digests
+        working-directory: core
+        run: |
+          set -euo pipefail
+          sha256sum ./* > "${RUNNER_TEMP}/SHA256SUMS"
+          mv "${RUNNER_TEMP}/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload core
+        uses: actions/upload-artifact@v4
+        with:
+          name: cbci-core
+          path: core/
+          retention-days: 3
+
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    needs: core
+    outputs:
+      wheel_matrix: ${{ steps.matrix.outputs.wheel_matrix }}
+    env:
+      CBCI_PROJECT_ROOT: ${{ github.workspace }}/sdk
+      CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v4
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      # upload-artifact does not preserve the executable bit.
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      # fetch-depth: 0 is load-bearing. engine.py resolves min_commit / drop_commit gates
+      # with `git merge-base --is-ancestor`, and a shallow clone makes every gate
+      # indeterminate instead of failing, silently dropping the versions they guard. Full
+      # depth also brings the tags the version stamp reads.
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Validate config
+        run: python "$CORE/engine.py" validate-config
+
+      - name: Display info
+        run: bash "$CORE/tasks.sh" display-info
+
+      # Inline until gha.py's `matrices` handles compiled projects. An abi3 unit covers
+      # every python (`pythons`, built on `build_python`), so there is no python to select;
+      # a non-abi3 config would plan one unit per python and fail the count check below.
+      - name: Build wheel matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          python "$CORE/engine.py" plan > plan.json
+          # Selected on libc, not platform: musllinux units carry platform "alpine".
+          matrix=$(jq -c '
+            [ .build.units[]
+              | select(.arch == "x86_64" and .libc == $ENV.PROBE_LIBC) ]
+            | {include: .}' plan.json)
+          count=$(jq '.include | length' <<<"$matrix")
+          echo "$matrix" | jq .
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly 1 unit for x86_64/${PROBE_LIBC}, plan has ${count}"
+            exit 1
+          fi
+          echo "wheel_matrix=$matrix" >> "$GITHUB_OUTPUT"
+        env:
+          # Via env, not `${{ }}` interpolation: a dispatch input spliced into a shell
+          # body is executed by it.
+          PROBE_LIBC: ${{ inputs.libc }}
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-plan
+          path: plan.json
+          retention-days: 3
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    needs: core
+    env:
+      CBCI_PROJECT_ROOT: ${{ github.workspace }}/sdk
+      CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v4
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      # CBCI_PRE_COMMIT_VERSION stays unset: the pin is for build agents whose git is too
+      # old for current pre-commit, which hosted runners are not.
+      - name: Lint
+        run: bash "$CORE/tasks.sh" lint
+        env:
+          CBCI_LOG_FILE: ${{ github.workspace }}/logs/lint.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-logs-lint
+          path: logs/
+          retention-days: 3
+          if-no-files-found: warn
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-24.04
+    needs: [core, lint]
+    env:
+      CBCI_PROJECT_ROOT: ${{ github.workspace }}/sdk
+      CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v4
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      # The only job that needs submodules: the sdist bakes the CPM cache from the
+      # bundled C++ core, and the wheel job then builds from that sdist.
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          path: sdk
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Build sdist
+        run: bash "$CORE/tasks.sh" sdist
+        env:
+          CBCI_LOG_FILE: ${{ github.workspace }}/logs/sdist.log
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-sdist
+          path: sdk/dist/*.tar.gz
+          retention-days: 3
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-logs-sdist
+          path: logs/
+          retention-days: 3
+          if-no-files-found: warn
+
+  wheel:
+    name: wheel ${{ matrix.libc }} ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    needs: [core, plan, sdist]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.wheel_matrix) }}
+    env:
+      # tasks.sh and engine.py read the build unit from these vars. CBCI_PYTHON_VERSION is
+      # set only for non-abi3 units, which carry `python`; empty reads as unset.
+      CBCI_BUILD_PLATFORM: ${{ matrix.platform }}
+      CBCI_BUILD_ARCH: ${{ matrix.arch }}
+      CBCI_BUILD_LIBC: ${{ matrix.libc }}
+      CBCI_PYTHON_VERSION: ${{ matrix.python }}
+      CBCI_PROJECT_ROOT: ${{ github.workspace }}/sdk
+      CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v4
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      # No submodules: this builds from the sdist, which carries the baked CPM cache.
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      # Into the SDK's dist/, which is where tasks.sh looks to decide whether to build
+      # from an sdist rather than the working tree.
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: probe-sdist
+          path: sdk/dist
+
+      # Same image the Jenkins agents build, so a failure is the runner's and not the
+      # image's. Off tests whether the stock pypa image carries enough toolchain.
+      - name: Build container image
+        if: ${{ inputs.custom_image }}
+        run: |
+          set -euo pipefail
+          bash "$CORE/tasks.sh" image
+          # tasks.sh reads the image from a libc/arch-specific var.
+          libc_uc=$(echo "$CBCI_BUILD_LIBC" | tr '[:lower:]' '[:upper:]')
+          arch_uc=$(echo "$CBCI_BUILD_ARCH" | tr '[:lower:]' '[:upper:]')
+          echo "CBCI_${libc_uc}_${arch_uc}_IMAGE=$CBCI_IMAGE" >> "$GITHUB_ENV"
+        env:
+          CBCI_IMAGE: couchbase/pycbc-ci-probe:local
+
+      - name: Build wheel
+        run: bash "$CORE/tasks.sh" wheel
+        env:
+          CBCI_BUILD_VERBOSITY: ${{ inputs.verbose && '3' || '' }}
+          CBCI_VERBOSE_MAKEFILE: ${{ inputs.verbose && 'on' || '' }}
+          CBCI_LOG_FILE: ${{ github.workspace }}/logs/wheel.log
+
+      # The release wheel is stripped and its .gnu_debuglink names a companion that ships
+      # separately. A debuglink with no companion looks healthy until someone needs a
+      # backtrace, so assert both halves landed.
+      - name: Check artifacts
+        working-directory: sdk
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          release=(wheelhouse/dist/*.whl)
+          companions=(wheelhouse/dist_debug/*.debug)
+          echo "release wheels:    ${release[*]:-none}"
+          echo "debug companions:  ${companions[*]:-none}"
+          [ "${#release[@]}" -ge 1 ] || { echo "::error::no release wheel"; exit 1; }
+          [ "${#companions[@]}" -ge 1 ] || { echo "::error::no .debug companion"; exit 1; }
+
+          so=$(unzip -Z1 "${release[0]}" | grep -E '\.so$' | head -1)
+          unzip -o -q "${release[0]}" "$so" -d unpacked
+
+          # By name, not exit status: `readelf -p` on an absent section warns and exits 0.
+          link=$(readelf -p .gnu_debuglink "unpacked/$so" 2>/dev/null \
+                 | grep -oE '[A-Za-z0-9._+-]+\.debug' | head -1 || true)
+          [ -n "$link" ] || { echo "::error::release .so carries no .gnu_debuglink"; exit 1; }
+          [ -f "wheelhouse/dist_debug/$link" ] \
+            || { echo "::error::debuglink names $link but no such file in dist_debug"; exit 1; }
+          echo "debuglink -> $link (companion present)"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-wheel-${{ matrix.libc }}-${{ matrix.arch }}
+          path: sdk/wheelhouse/dist/*.whl
+          retention-days: 3
+
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-debug-${{ matrix.libc }}-${{ matrix.arch }}
+          path: sdk/wheelhouse/dist_debug/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-logs-wheel-${{ matrix.libc }}-${{ matrix.arch }}
+          path: logs/
+          retention-days: 3
+          if-no-files-found: warn
