@@ -374,7 +374,9 @@ jobs:
           path: sdk/wheelhouse/dist/*.whl
           retention-days: 3
 
+      # Off unless build.archive_debug_symbols says so (see config_override).
       - name: Upload debug artifacts
+        if: ${{ matrix.archive_debug }}
         uses: actions/upload-artifact@v7
         with:
           name: probe-debug-${{ matrix.libc }}-${{ matrix.arch }}
