@@ -1,12 +1,7 @@
 name: cbci-probe
 
-# Smallest end-to-end exercise of the CI-core contract on GitHub-hosted runners:
-#
-#   core -> plan -> lint -> sdist -> ONE linux x86_64 wheel
-#
-# The point is the boundary, not the support matrix: does `engine.py plan` feed a GHA
-# matrix, and does `tasks.sh` run unmodified on a hosted runner? One build unit answers
-# both.
+# Smoke test of the CI core on hosted runners: core -> plan -> lint -> sdist -> one
+# linux x86_64 wheel.
 
 on:
   workflow_dispatch:
@@ -60,11 +55,9 @@ concurrency:
 env:
   CBCI_PROJECT_TYPE: OPERATIONAL
   CORE: ${{ github.workspace }}/core
-  # The SDK is checked out into a subdirectory so the staged core never lands inside its
-  # tree, where it would dirty the version stamp and be seen by lint.
+  # Kept apart from the core so the core never dirties the version stamp or gets linted.
   SDK: ${{ github.workspace }}/sdk
-  # Interpreter that runs the tooling, independent of the wheels' pythons. Must equal
-  # `support.default_python` in ci-config; gha.py fails the run when the two disagree.
+  # Tooling interpreter; gha.py fails if it differs from support.default_python.
   CBCI_DEFAULT_PYTHON: "3.11"
 
 jobs:
@@ -72,8 +65,7 @@ jobs:
     name: core (${{ inputs.cbci_ref }})
     runs-on: ubuntu-24.04
     steps:
-      # bootstrap.sh fetches the fixed manifest from the same base and verifies every file
-      # against the hashes it pins.
+      # bootstrap.sh verifies every file against its pinned sha256.
       - name: Stage CI core
         run: |
           set -euo pipefail
@@ -86,7 +78,7 @@ jobs:
           CBCI_REF: ${{ inputs.cbci_ref }}
           CBCI_PATH: ${{ inputs.cbci_path }}
 
-      # Artifact transfer is not a verified channel, so every consumer re-checks these.
+      # Re-checked by every consumer: artifacts are not a verified channel.
       - name: Record core digests
         working-directory: core
         run: |
@@ -126,10 +118,7 @@ jobs:
       - name: Enable core scripts
         run: chmod +x "$CORE/tasks.sh"
 
-      # fetch-depth: 0 is load-bearing. engine.py resolves min_commit / drop_commit gates
-      # with `git merge-base --is-ancestor`, and a shallow clone makes every gate
-      # indeterminate instead of failing, silently dropping the versions they guard. Full
-      # depth also brings the tags the version stamp reads.
+      # Full depth: the commit gates and the version stamp both need history and tags.
       - name: Checkout SDK
         uses: actions/checkout@v7
         with:
@@ -150,36 +139,32 @@ jobs:
       - name: Display info
         run: bash "$CORE/tasks.sh" display-info
 
-      # Inline until gha.py's `matrices` handles compiled projects. An abi3 unit covers
-      # every python (`pythons`, built on `build_python`), so there is no python to select;
-      # a non-abi3 config would plan one unit per python and fail the count check below.
+      # One build_wheel cell, picked by libc (musllinux cells have platform "alpine").
       - name: Build wheel matrix
         id: matrix
         run: |
           set -euo pipefail
-          python "$CORE/engine.py" plan > plan.json
-          # Selected on libc, not platform: musllinux units carry platform "alpine".
+          python "$CORE/gha.py" matrices > matrices.json
           matrix=$(jq -c '
-            [ .build.units[]
+            [ .build_wheel.include[]
               | select(.arch == "x86_64" and .libc == $ENV.PROBE_LIBC) ]
-            | {include: .}' plan.json)
+            | {include: .}' matrices.json)
           count=$(jq '.include | length' <<<"$matrix")
           echo "$matrix" | jq .
           if [ "$count" -ne 1 ]; then
-            echo "::error::expected exactly 1 unit for x86_64/${PROBE_LIBC}, plan has ${count}"
+            echo "::error::expected exactly 1 cell for x86_64/${PROBE_LIBC}, build_wheel has ${count}"
             exit 1
           fi
           echo "wheel_matrix=$matrix" >> "$GITHUB_OUTPUT"
         env:
-          # Via env, not `${{ }}` interpolation: a dispatch input spliced into a shell
-          # body is executed by it.
+          # Via env: an input interpolated into the script would be executed.
           PROBE_LIBC: ${{ inputs.libc }}
 
       - name: Upload plan
         uses: actions/upload-artifact@v7
         with:
           name: probe-plan
-          path: plan.json
+          path: matrices.json
           retention-days: 3
 
   lint:
@@ -217,8 +202,7 @@ jobs:
       - name: Install engine deps
         run: python -m pip install --upgrade pip pyyaml
 
-      # CBCI_PRE_COMMIT_VERSION stays unset: the pin is for build agents whose git is too
-      # old for current pre-commit, which hosted runners are not.
+      # CBCI_PRE_COMMIT_VERSION unset: the pin is only for agents with an old git.
       - name: Lint
         run: bash "$CORE/tasks.sh" lint
         env:
@@ -254,8 +238,7 @@ jobs:
       - name: Enable core scripts
         run: chmod +x "$CORE/tasks.sh"
 
-      # The only job that needs submodules: the sdist bakes the CPM cache from the
-      # bundled C++ core, and the wheel job then builds from that sdist.
+      # Submodules here only: the sdist bakes the CPM cache the wheel builds from.
       - name: Checkout SDK
         uses: actions/checkout@v7
         with:
@@ -294,14 +277,13 @@ jobs:
 
   wheel:
     name: wheel ${{ matrix.libc }} ${{ matrix.arch }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     needs: [core, plan, sdist]
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.wheel_matrix) }}
     env:
-      # tasks.sh and engine.py read the build unit from these vars. CBCI_PYTHON_VERSION is
-      # set only for non-abi3 units, which carry `python`; empty reads as unset.
+      # CBCI_PYTHON_VERSION is empty for abi3 cells, which reads as unset.
       CBCI_BUILD_PLATFORM: ${{ matrix.platform }}
       CBCI_BUILD_ARCH: ${{ matrix.arch }}
       CBCI_BUILD_LIBC: ${{ matrix.libc }}
@@ -322,7 +304,6 @@ jobs:
       - name: Enable core scripts
         run: chmod +x "$CORE/tasks.sh"
 
-      # No submodules: this builds from the sdist, which carries the baked CPM cache.
       - name: Checkout SDK
         uses: actions/checkout@v7
         with:
@@ -337,27 +318,23 @@ jobs:
       - name: Install engine deps
         run: python -m pip install --upgrade pip pyyaml
 
-      # Into the SDK's dist/, which is where tasks.sh looks to decide whether to build
-      # from an sdist rather than the working tree.
+      # tasks.sh builds from dist/*.tar.gz when present.
       - name: Download sdist
         uses: actions/download-artifact@v8
         with:
           name: probe-sdist
           path: sdk/dist
 
-      # Same image the Jenkins agents build, so a failure is the runner's and not the
-      # image's. Off tests whether the stock pypa image carries enough toolchain.
+      # Same image as Jenkins; off uses the stock pypa image.
       - name: Build container image
         if: ${{ inputs.custom_image }}
         run: |
           set -euo pipefail
           bash "$CORE/tasks.sh" image
-          # tasks.sh reads the image from a libc/arch-specific var.
-          libc_uc=$(echo "$CBCI_BUILD_LIBC" | tr '[:lower:]' '[:upper:]')
-          arch_uc=$(echo "$CBCI_BUILD_ARCH" | tr '[:lower:]' '[:upper:]')
-          echo "CBCI_${libc_uc}_${arch_uc}_IMAGE=$CBCI_IMAGE" >> "$GITHUB_ENV"
+          echo "${IMAGE_VAR}=${CBCI_IMAGE}" >> "$GITHUB_ENV"
         env:
-          CBCI_IMAGE: couchbase/pycbc-ci-probe:local
+          CBCI_IMAGE: ${{ matrix.image }}
+          IMAGE_VAR: ${{ matrix.image_var }}
 
       - name: Build wheel
         run: bash "$CORE/tasks.sh" wheel
@@ -366,9 +343,7 @@ jobs:
           CBCI_VERBOSE_MAKEFILE: ${{ inputs.verbose && 'on' || '' }}
           CBCI_LOG_FILE: ${{ github.workspace }}/logs/wheel.log
 
-      # The release wheel is stripped and its .gnu_debuglink names a companion that ships
-      # separately. A debuglink with no companion looks healthy until someone needs a
-      # backtrace, so assert both halves landed.
+      # The stripped wheel's .gnu_debuglink must name a .debug companion that exists.
       - name: Check artifacts
         working-directory: sdk
         run: |
@@ -384,7 +359,7 @@ jobs:
           so=$(unzip -Z1 "${release[0]}" | grep -E '\.so$' | head -1)
           unzip -o -q "${release[0]}" "$so" -d unpacked
 
-          # By name, not exit status: `readelf -p` on an absent section warns and exits 0.
+          # `readelf -p` exits 0 when the section is missing, so match the name.
           link=$(readelf -p .gnu_debuglink "unpacked/$so" 2>/dev/null \
                  | grep -oE '[A-Za-z0-9._+-]+\.debug' | head -1 || true)
           [ -n "$link" ] || { echo "::error::release .so carries no .gnu_debuglink"; exit 1; }
