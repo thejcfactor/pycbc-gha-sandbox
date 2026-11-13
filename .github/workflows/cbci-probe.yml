@@ -96,7 +96,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Upload core
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cbci-core
           path: core/
@@ -113,7 +113,7 @@ jobs:
       CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
     steps:
       - name: Download CI core
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cbci-core
           path: core
@@ -131,13 +131,13 @@ jobs:
       # indeterminate instead of failing, silently dropping the versions they guard. Full
       # depth also brings the tags the version stamp reads.
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: sdk
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
 
@@ -176,7 +176,7 @@ jobs:
           PROBE_LIBC: ${{ inputs.libc }}
 
       - name: Upload plan
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-plan
           path: plan.json
@@ -191,7 +191,7 @@ jobs:
       CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
     steps:
       - name: Download CI core
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cbci-core
           path: core
@@ -204,13 +204,13 @@ jobs:
         run: chmod +x "$CORE/tasks.sh"
 
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: sdk
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
 
@@ -226,7 +226,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-logs-lint
           path: logs/
@@ -242,7 +242,7 @@ jobs:
       CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
     steps:
       - name: Download CI core
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cbci-core
           path: core
@@ -257,14 +257,14 @@ jobs:
       # The only job that needs submodules: the sdist bakes the CPM cache from the
       # bundled C++ core, and the wheel job then builds from that sdist.
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: sdk
           fetch-depth: 0
           submodules: recursive
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
 
@@ -277,7 +277,7 @@ jobs:
           CBCI_LOG_FILE: ${{ github.workspace }}/logs/sdist.log
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-sdist
           path: sdk/dist/*.tar.gz
@@ -285,7 +285,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-logs-sdist
           path: logs/
@@ -310,7 +310,7 @@ jobs:
       CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
     steps:
       - name: Download CI core
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cbci-core
           path: core
@@ -324,13 +324,13 @@ jobs:
 
       # No submodules: this builds from the sdist, which carries the baked CPM cache.
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: sdk
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
 
@@ -340,7 +340,7 @@ jobs:
       # Into the SDK's dist/, which is where tasks.sh looks to decide whether to build
       # from an sdist rather than the working tree.
       - name: Download sdist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: probe-sdist
           path: sdk/dist
@@ -393,14 +393,14 @@ jobs:
           echo "debuglink -> $link (companion present)"
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-wheel-${{ matrix.libc }}-${{ matrix.arch }}
           path: sdk/wheelhouse/dist/*.whl
           retention-days: 3
 
       - name: Upload debug artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-debug-${{ matrix.libc }}-${{ matrix.arch }}
           path: sdk/wheelhouse/dist_debug/
@@ -409,7 +409,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: probe-logs-wheel-${{ matrix.libc }}-${{ matrix.arch }}
           path: logs/
