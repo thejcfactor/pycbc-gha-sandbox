@@ -417,8 +417,11 @@ jobs:
     name: validate ${{ matrix.platform }} ${{ matrix.arch }} py${{ matrix.python }} ${{ matrix.install_type }}
     runs-on: ${{ matrix.os }}
     needs: [core, plan, sdist, build]
-    # Runs the cells whose wheel did build; a missing one fails at its download.
-    if: ${{ !cancelled() && needs.sdist.result == 'success' && needs.plan.outputs.has_validate == 'true' }}
+    # Any failed build cell stops the stage; a skipped build (sdist-only) still validates.
+    if: >-
+      ${{ !cancelled() && needs.sdist.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.build.result)
+      && needs.plan.outputs.has_validate == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.validate_matrix) }}
