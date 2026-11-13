@@ -1,0 +1,521 @@
+name: build_wheels
+
+# Full build matrix: core -> plan -> lint -> sdist -> wheels -> validate, with every cell
+# taken from `gha.py matrices`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cbci_repo:
+        description: "Public repository holding the CI core."
+        required: false
+        default: "couchbaselabs/sdkbuild-jenkinsfiles"
+        type: string
+      cbci_ref:
+        description: "CI core ref (branch/tag/sha). A work branch tests unpublished core."
+        required: false
+        default: "master"
+        type: string
+      cbci_path:
+        description: "Directory of the CI core inside cbci_repo."
+        required: false
+        default: "python/ci_scripts_v2"
+        type: string
+      platforms:
+        description: "Narrow to these platforms (linux, alpine, macos, windows). Blank = config."
+        required: false
+        default: ""
+        type: string
+      arches:
+        description: "Narrow to these arches (x86_64, arm64). Blank = config."
+        required: false
+        default: ""
+        type: string
+      python_versions:
+        description: "Narrow to these pythons, e.g. 3.10,3.14. Blank = config."
+        required: false
+        default: ""
+        type: string
+      install_types:
+        description: "Validate installs: wheel, sdist or both. sdist compiles in every validate cell."
+        required: false
+        default: "wheel"
+        type: string
+      kv_smoke:
+        description: "Validate also round-trips a document against GoCAVES."
+        required: false
+        default: false
+        type: boolean
+      is_release:
+        description: "Release build (CBCI_IS_RELEASE): release version stamp, long artifact retention."
+        required: false
+        default: false
+        type: boolean
+      custom_image:
+        description: "Build the couchbase linux images first (matches Jenkins). Off uses the stock pypa images."
+        required: false
+        default: true
+        type: boolean
+      config_override:
+        description: "JSON object deep-merged over ci-config.yaml (CBCI_CONFIG_OVERRIDE)."
+        required: false
+        default: ""
+        type: string
+      verbose:
+        description: "Verbose compiler/CMake output."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build_wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CBCI_PROJECT_TYPE: OPERATIONAL
+  CORE: ${{ github.workspace }}/core
+  # Kept apart from the core so the core never dirties the version stamp or gets linted.
+  SDK: ${{ github.workspace }}/sdk
+  CBCI_PROJECT_ROOT: ${{ github.workspace }}/sdk
+  # Tooling interpreter; gha.py fails if it differs from support.default_python.
+  CBCI_DEFAULT_PYTHON: "3.11"
+  # Every job resolves the same plan, so every job gets the same narrowing.
+  PLATFORMS: ${{ inputs.platforms }}
+  ARCHES: ${{ inputs.arches }}
+  PYTHON_VERSIONS: ${{ inputs.python_versions }}
+  INSTALL_TYPES: ${{ inputs.install_types }}
+  CBCI_CONFIG_OVERRIDE: ${{ inputs.config_override }}
+  CBCI_IS_RELEASE: ${{ inputs.is_release && 'true' || '' }}
+  RETENTION_DAYS: ${{ inputs.is_release && 30 || 3 }}
+
+jobs:
+  core:
+    name: core (${{ inputs.cbci_ref }})
+    runs-on: ubuntu-24.04
+    steps:
+      # bootstrap.sh verifies every file against its pinned sha256.
+      - name: Stage CI core
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/${CBCI_REPO}/${CBCI_REF}/${CBCI_PATH}"
+          echo "CI core from ${base}"
+          curl -fsSL "${base}/bootstrap.sh" -o "${RUNNER_TEMP}/bootstrap.sh"
+          CBCI_BASE_URL="$base" CBCI_DEST="$CORE" bash "${RUNNER_TEMP}/bootstrap.sh"
+        env:
+          CBCI_REPO: ${{ inputs.cbci_repo }}
+          CBCI_REF: ${{ inputs.cbci_ref }}
+          CBCI_PATH: ${{ inputs.cbci_path }}
+
+      # Re-checked by every consumer: artifacts are not a verified channel.
+      - name: Record core digests
+        working-directory: core
+        run: |
+          set -euo pipefail
+          sha256sum ./* > "${RUNNER_TEMP}/SHA256SUMS"
+          mv "${RUNNER_TEMP}/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload core
+        uses: actions/upload-artifact@v7
+        with:
+          name: cbci-core
+          path: core/
+          retention-days: 3
+
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    needs: core
+    outputs:
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
+      has_build: ${{ steps.matrix.outputs.has_build }}
+      validate_matrix: ${{ steps.matrix.outputs.validate_matrix }}
+      has_validate: ${{ steps.matrix.outputs.has_validate }}
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v8
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      # upload-artifact does not preserve the executable bit.
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      # Full depth: the commit gates and the version stamp both need history and tags.
+      - name: Checkout SDK
+        uses: actions/checkout@v7
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Validate config
+        run: python "$CORE/engine.py" validate-config
+
+      - name: Display info
+        run: bash "$CORE/tasks.sh" display-info
+
+      - name: Build matrices
+        id: matrix
+        run: |
+          set -euo pipefail
+          python "$CORE/gha.py" matrices > matrices.json
+          jq . matrices.json
+          {
+            echo "build_matrix=$(jq -c '{include: .build_wheel.include}' matrices.json)"
+            echo "has_build=$(jq -c '.build_wheel.has_build_wheel' matrices.json)"
+            echo "validate_matrix=$(jq -c '{include: .validate_wheel.include}' matrices.json)"
+            echo "has_validate=$(jq -c '.validate_wheel.has_validate_wheel' matrices.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v7
+        with:
+          name: plan
+          path: matrices.json
+          retention-days: ${{ env.RETENTION_DAYS }}
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    needs: core
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v8
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      - name: Checkout SDK
+        uses: actions/checkout@v7
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      # CBCI_PRE_COMMIT_VERSION unset: the pin is only for agents with an old git.
+      - name: Lint
+        run: bash "$CORE/tasks.sh" lint
+        env:
+          CBCI_LOG_FILE: ${{ github.workspace }}/logs/lint.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-lint
+          path: logs/
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-24.04
+    needs: [core, lint]
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v8
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        run: chmod +x "$CORE/tasks.sh"
+
+      # Submodules here only: the sdist bakes the CPM cache the wheels build from.
+      - name: Checkout SDK
+        uses: actions/checkout@v7
+        with:
+          path: sdk
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Build sdist
+        run: bash "$CORE/tasks.sh" sdist
+        env:
+          CBCI_LOG_FILE: ${{ github.workspace }}/logs/sdist.log
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: sdk/dist/*.tar.gz
+          retention-days: ${{ env.RETENTION_DAYS }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-sdist
+          path: logs/
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  build:
+    name: build ${{ matrix.platform }} ${{ matrix.arch }}${{ matrix.python && format(' py{0}', matrix.python) || '' }}
+    runs-on: ${{ matrix.os }}
+    needs: [core, plan, sdist]
+    if: ${{ needs.plan.outputs.has_build == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.build_matrix) }}
+    env:
+      # CBCI_PYTHON_VERSION is empty for abi3 cells, which reads as unset.
+      CBCI_BUILD_PLATFORM: ${{ matrix.platform }}
+      CBCI_BUILD_ARCH: ${{ matrix.arch }}
+      CBCI_BUILD_LIBC: ${{ matrix.libc }}
+      CBCI_PYTHON_VERSION: ${{ matrix.python }}
+      CBCI_BUILD_VERBOSITY: ${{ inputs.verbose && '3' || '' }}
+      CBCI_VERBOSE_MAKEFILE: ${{ inputs.verbose && 'on' || '' }}
+      CBCI_LOG_FILE: ${{ github.workspace }}/logs/wheel.log
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v8
+        with:
+          name: cbci-core
+          path: core
+
+      # bash on every runner, Windows included (Git Bash).
+      - name: Verify core digests
+        shell: bash
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        if: runner.os != 'Windows'
+        run: chmod +x "$CORE/tasks.sh"
+
+      - name: Checkout SDK
+        uses: actions/checkout@v7
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.CBCI_DEFAULT_PYTHON }}
+
+      - name: Install engine deps
+        run: python -m pip install --upgrade pip pyyaml
+
+      # tasks.sh / tasks.ps1 build from dist/*.tar.gz when present.
+      - name: Download sdist
+        uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: sdk/dist
+
+      # Same image as Jenkins; off uses the stock pypa image.
+      - name: Build container image
+        if: ${{ inputs.custom_image && matrix.image }}
+        run: |
+          set -euo pipefail
+          bash "$CORE/tasks.sh" image
+          echo "${IMAGE_VAR}=${CBCI_IMAGE}" >> "$GITHUB_ENV"
+        env:
+          CBCI_IMAGE: ${{ matrix.image }}
+          IMAGE_VAR: ${{ matrix.image_var }}
+
+      - name: Build wheel
+        if: runner.os != 'Windows'
+        run: bash "$CORE/tasks.sh" wheel
+
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& "$env:CORE/tasks.ps1" wheel'
+
+      # The stripped wheel's .gnu_debuglink must name a .debug companion that exists.
+      - name: Check debuglink
+        if: runner.os == 'Linux'
+        working-directory: sdk
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          release=(wheelhouse/dist/*.whl)
+          [ "${#release[@]}" -ge 1 ] || { echo "::error::no release wheel"; exit 1; }
+          so=$(unzip -Z1 "${release[0]}" | grep -E '\.so$' | head -1)
+          unzip -o -q "${release[0]}" "$so" -d unpacked
+          # `readelf -p` exits 0 when the section is missing, so match the name.
+          link=$(readelf -p .gnu_debuglink "unpacked/$so" 2>/dev/null \
+                 | grep -oE '[A-Za-z0-9._+-]+\.debug' | head -1 || true)
+          [ -n "$link" ] || { echo "::error::release .so carries no .gnu_debuglink"; exit 1; }
+          [ -f "wheelhouse/dist_debug/$link" ] \
+            || { echo "::error::debuglink names $link but no such file in dist_debug"; exit 1; }
+          echo "debuglink -> $link (companion present)"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: sdk/wheelhouse/dist/*.whl
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: error
+
+      # Off unless build.archive_debug_symbols says so (see config_override).
+      - name: Upload debug artifacts
+        if: ${{ matrix.archive_debug }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: debug-${{ matrix.artifact }}
+          path: sdk/wheelhouse/dist_debug/
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.artifact }}
+          path: logs/
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: warn
+
+  validate:
+    name: validate ${{ matrix.platform }} ${{ matrix.arch }} py${{ matrix.python }} ${{ matrix.install_type }}
+    runs-on: ${{ matrix.os }}
+    needs: [core, plan, sdist, build]
+    # Runs the cells whose wheel did build; a missing one fails at its download.
+    if: ${{ !cancelled() && needs.sdist.result == 'success' && needs.plan.outputs.has_validate == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.validate_matrix) }}
+    env:
+      CBCI_INSTALL_TYPE: ${{ matrix.install_type }}
+      CBCI_VALIDATE_KV: ${{ inputs.kv_smoke && 'true' || '' }}
+      CBCI_LOG_FILE: ${{ github.workspace }}/logs/validate.log
+      LOG_NAME: logs-validate-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.python }}-${{ matrix.install_type }}
+    steps:
+      - name: Download CI core
+        uses: actions/download-artifact@v8
+        with:
+          name: cbci-core
+          path: core
+
+      - name: Verify core digests
+        shell: bash
+        working-directory: core
+        run: sha256sum -c SHA256SUMS
+
+      - name: Enable core scripts
+        if: runner.os != 'Windows'
+        run: chmod +x "$CORE/tasks.sh"
+
+      - name: Checkout SDK
+        uses: actions/checkout@v7
+        with:
+          path: sdk
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download wheel
+        if: ${{ matrix.install_type == 'wheel' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.wheel_artifact }}
+          path: sdk/wheelhouse/dist
+
+      - name: Download sdist
+        if: ${{ matrix.install_type == 'sdist' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: sdk/dist
+
+      # The cell's python both drives tasks.sh and seeds the clean venv it installs into.
+      - uses: actions/setup-python@v7
+        if: ${{ matrix.platform != 'alpine' }}
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+
+      - name: Install engine deps
+        if: ${{ matrix.platform != 'alpine' }}
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Validate
+        if: ${{ matrix.platform != 'alpine' && runner.os != 'Windows' }}
+        run: bash "$CORE/tasks.sh" validate
+
+      - name: Validate (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& "$env:CORE/tasks.ps1" validate'
+
+      # No musl runner, and JS actions cannot run in an alpine container on arm64, so the
+      # cell runs tasks.sh in a python:<py>-alpine container over the same workspace.
+      - name: Validate (alpine)
+        if: ${{ matrix.platform == 'alpine' }}
+        run: |
+          set -euo pipefail
+          pass=()
+          for v in CORE CBCI_PROJECT_TYPE CBCI_PROJECT_ROOT CBCI_DEFAULT_PYTHON PLATFORMS ARCHES \
+                   PYTHON_VERSIONS INSTALL_TYPES CBCI_CONFIG_OVERRIDE CBCI_IS_RELEASE \
+                   CBCI_INSTALL_TYPE CBCI_VALIDATE_KV CBCI_LOG_FILE; do
+            pass+=(-e "$v")
+          done
+          docker run --rm "${pass[@]}" -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -w "$GITHUB_WORKSPACE" "python:${PY}-alpine" sh -euc '
+              apk add --no-cache bash coreutils findutils curl git >/dev/null
+              # sdist installs compile the extension.
+              if [ "$CBCI_INSTALL_TYPE" = sdist ]; then
+                apk add --no-cache build-base cmake linux-headers >/dev/null
+              fi
+              # The workspace belongs to the runner user, not root.
+              git config --global --add safe.directory "*"
+              python -m pip install --root-user-action=ignore --upgrade pip pyyaml >/dev/null
+              bash "$CORE/tasks.sh" validate
+            '
+        env:
+          PY: ${{ matrix.python }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.LOG_NAME }}
+          path: logs/
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: warn
